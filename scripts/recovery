@@ -1,0 +1,48 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+RECOVERY_BOOT_ORDER="0xf461"
+
+fail() {
+    printf '[FAIL] %s\n' "$1" >&2
+    exit 1
+}
+
+ok() {
+    printf '[ OK ] %s\n' "$1"
+}
+
+[[ "$EUID" -eq 0 ]] || fail "Cette commande doit être exécutée avec sudo."
+
+ROOT_DEVICE="$(findmnt -no SOURCE /)"
+ROOT_DISK="$(lsblk -no PKNAME "$ROOT_DEVICE" 2>/dev/null | head -n1 || true)"
+
+[[ "$ROOT_DISK" == nvme* ]] \
+    || fail "Le système principal ne semble pas fonctionner depuis le NVMe : $ROOT_DEVICE"
+
+[[ -b /dev/mmcblk0 ]] \
+    || fail "Aucune microSD détectée."
+
+command -v vcmailbox >/dev/null 2>&1 \
+    || fail "vcmailbox est absent."
+
+if [[ "${1:-}" == "--check" ]]; then
+    ok "Système principal sur NVMe : $ROOT_DEVICE"
+    ok "microSD détectée : /dev/mmcblk0"
+    ok "Prochain boot Recovery one-shot : $RECOVERY_BOOT_ORDER"
+    exit 0
+fi
+
+[[ $# -eq 0 ]] || {
+    echo "Usage : sudo recovery [--check]"
+    exit 1
+}
+
+echo "Passage au système Recovery..."
+sync
+
+vcmailbox 0x0003808b 4 4 "$RECOVERY_BOOT_ORDER"
+
+echo "Redémarrage sur microSD..."
+sleep 2
+systemctl reboot

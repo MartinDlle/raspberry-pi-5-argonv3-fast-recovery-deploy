@@ -1,0 +1,615 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+BASE="/opt/pi-recovery"
+BACKUP="$BASE/backup"
+IMAGE="$BASE/images/raspios-lite-arm64.img.xz"
+SCRIPTS="$BASE/scripts"
+LOGDIR="$BASE/logs"
+
+TARGET="/dev/nvme0n1"
+P1="${TARGET}p1"
+P2="${TARGET}p2"
+
+AUTHFILE="/run/reset-pi-authorized"
+LOCKFILE="/run/reset-pi.lock"
+
+ok() {
+    printf '[ OK ] %s\n' "$1"
+}
+
+warn() {
+    printf '[WARN] %s\n' "$1"
+}
+
+fail() {
+    printf '[FAIL] %s\n' "$1" >&2
+    exit 1
+}
+
+require_root() {
+    [[ "$EUID" -eq 0 ]] || fail "Cette commande doit être exécutée avec sudo."
+}
+
+read_required() {
+    local FILE="$1"
+    [[ -s "$FILE" ]] || fail "Fichier obligatoire absent : $FILE"
+    tr -d '\r\n' < "$FILE"
+}
+
+validate_username() {
+    local USERNAME="$1"
+
+    [[ "$USERNAME" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
+        || fail "Nom d'utilisateur Linux invalide : '$USERNAME'"
+
+    [[ "$USERNAME" != "root" ]] \
+        || fail "Le nom d'utilisateur 'root' est interdit."
+}
+
+check_dependencies() {
+    local CMD
+    local REQUIRED_CMDS=(
+        awk dd e2fsck findmnt flock grep install lsblk mount mountpoint
+        partprobe parted python3 resize2fs rpi-eeprom-config sha256sum
+        swapoff systemctl systemd-run tee udevadm umount xargs xz
+    )
+
+    for CMD in "${REQUIRED_CMDS[@]}"; do
+        command -v "$CMD" >/dev/null 2>&1 \
+            || fail "Commande requise absente : $CMD"
+    done
+
+    python3 -c 'import yaml' >/dev/null 2>&1 \
+        || fail "Module Python yaml absent : sudo apt install python3-yaml"
+
+    ok "Dépendances système présentes"
+}
+
+check_environment() {
+    local ROOT_DEVICE ROOT_DISK
+    local MODEL SERIAL SIZE EXPECTED_MODEL EXPECTED_SERIAL EXPECTED_SIZE
+    local EXPECTED_SHA ACTUAL_SHA BOOT_ORDER MOUNTS
+
+    check_dependencies
+
+    ROOT_DEVICE="$(findmnt -no SOURCE /)"
+    ROOT_DISK="$(lsblk -no PKNAME "$ROOT_DEVICE" 2>/dev/null | head -n1 || true)"
+
+    [[ "$ROOT_DISK" == "mmcblk0" ]] \
+        || fail "Le système n'est pas démarré depuis la microSD : $ROOT_DEVICE"
+
+    ok "Recovery exécuté depuis la microSD : $ROOT_DEVICE"
+
+    [[ -b "$TARGET" ]] || fail "$TARGET introuvable."
+
+    EXPECTED_MODEL="$(read_required "$BACKUP/system/nvme.model")"
+    EXPECTED_SERIAL="$(read_required "$BACKUP/system/nvme.serial")"
+    EXPECTED_SIZE="$(read_required "$BACKUP/system/nvme.size_bytes")"
+
+    MODEL="$(lsblk -dn -o MODEL "$TARGET" | xargs)"
+    SERIAL="$(lsblk -dn -o SERIAL "$TARGET" | xargs)"
+    SIZE="$(lsblk -bdn -o SIZE "$TARGET" | xargs)"
+
+    [[ "$MODEL" == "$EXPECTED_MODEL" ]] \
+        || fail "Modèle NVMe inattendu : '$MODEL'"
+    ok "Modèle NVMe confirmé : $MODEL"
+
+    [[ "$SERIAL" == "$EXPECTED_SERIAL" ]] \
+        || fail "Le numéro de série du NVMe ne correspond pas au disque autorisé."
+    ok "Numéro de série NVMe confirmé."
+
+    [[ "$SIZE" == "$EXPECTED_SIZE" ]] \
+        || fail "Taille NVMe inattendue : $SIZE octets"
+    ok "Taille NVMe confirmée."
+
+    [[ -s "$IMAGE" ]] || fail "Image Raspberry Pi OS absente."
+
+    xz -t "$IMAGE" || fail "Archive XZ corrompue."
+    ok "Archive XZ valide"
+
+    EXPECTED_SHA="$(read_required "$BACKUP/system/image.sha256")"
+    ACTUAL_SHA="$(sha256sum "$IMAGE" | awk '{print $1}')"
+
+    [[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]] \
+        || fail "SHA-256 de l'image incorrect."
+    ok "SHA-256 correct"
+
+    local REQUIRED=(
+        "$BACKUP/ssh/authorized_keys"
+        "$BACKUP/ssh/hostkeys/ssh_host_ed25519_key"
+        "$BACKUP/ssh/hostkeys/ssh_host_ed25519_key.pub"
+        "$BACKUP/ssh/hostkeys/ssh_host_ecdsa_key"
+        "$BACKUP/ssh/hostkeys/ssh_host_ecdsa_key.pub"
+        "$BACKUP/ssh/hostkeys/ssh_host_rsa_key"
+        "$BACKUP/ssh/hostkeys/ssh_host_rsa_key.pub"
+        "$BACKUP/user/user.passwd-hash"
+        "$BACKUP/user/user.uidgid"
+        "$BACKUP/system/default_username"
+        "$BACKUP/system/hostname"
+        "$BACKUP/system/timezone"
+        "$BACKUP/system/nvme.model"
+        "$BACKUP/system/nvme.serial"
+        "$BACKUP/system/nvme.size_bytes"
+        "$BACKUP/system/image.sha256"
+        "$BACKUP/argon/argononed.conf"
+        "$SCRIPTS/recovery"
+        "$SCRIPTS/argon1.sh"
+    )
+
+    local FILE
+    for FILE in "${REQUIRED[@]}"; do
+        [[ -s "$FILE" ]] || fail "Fichier obligatoire absent : $FILE"
+    done
+
+    ok "Coffre Recovery complet"
+
+    BOOT_ORDER="$(
+        rpi-eeprom-config 2>/dev/null |
+        awk -F= '$1=="BOOT_ORDER"{print $2}' |
+        tail -n1
+    )"
+
+    [[ "$BOOT_ORDER" == "0xf416" ]] \
+        || fail "BOOT_ORDER inattendu : ${BOOT_ORDER:-inconnu}"
+
+    ok "BOOT_ORDER : 0xf416"
+
+    echo
+
+    MOUNTS="$(
+        findmnt -rn -S "$P1" -o SOURCE,TARGET,OPTIONS 2>/dev/null || true
+        findmnt -rn -S "$P2" -o SOURCE,TARGET,OPTIONS 2>/dev/null || true
+    )"
+
+    if [[ -n "$MOUNTS" ]]; then
+        warn "Partitions NVMe actuellement montées :"
+        echo "$MOUNTS"
+        warn "Elles seront démontées automatiquement pendant le reset."
+    else
+        ok "NVMe non monté"
+    fi
+}
+
+worker_authorized() {
+    [[ -n "${RESET_PI_TOKEN:-}" ]] || fail "Worker non autorisé."
+    [[ -s "$AUTHFILE" ]] || fail "Autorisation de reset absente."
+
+    local SAVED_TOKEN
+    SAVED_TOKEN="$(cat "$AUTHFILE")"
+
+    [[ "$RESET_PI_TOKEN" == "$SAVED_TOKEN" ]] \
+        || fail "Jeton d'autorisation incorrect."
+
+    rm -f "$AUTHFILE"
+}
+
+unmount_nvme_completely() {
+    local DEV MP
+
+    echo
+    echo "Démontage complet du NVMe..."
+
+    while read -r DEV; do
+        [[ -n "$DEV" ]] || continue
+        swapoff "$DEV" 2>/dev/null || true
+    done < <(
+        lsblk -nrpo NAME,TYPE "$TARGET" |
+        awk '$2=="part"{print $1}'
+    )
+
+    for DEV in "$P2" "$P1"; do
+        while findmnt -rn -S "$DEV" >/dev/null 2>&1; do
+            MP="$(findmnt -rn -S "$DEV" -o TARGET | head -n1)"
+
+            [[ -n "$MP" ]] \
+                || fail "Montage détecté pour $DEV mais point de montage introuvable."
+
+            echo "Unmount : $DEV -> $MP"
+            umount "$MP"
+        done
+    done
+
+    sync
+    udevadm settle || true
+
+    if findmnt -rn -S "$P1" >/dev/null 2>&1 || \
+       findmnt -rn -S "$P2" >/dev/null 2>&1; then
+
+        findmnt -rn -S "$P1" -o SOURCE,TARGET,OPTIONS 2>/dev/null || true
+        findmnt -rn -S "$P2" -o SOURCE,TARGET,OPTIONS 2>/dev/null || true
+
+        fail "Une partition NVMe est encore montée."
+    fi
+
+    ok "Toutes les partitions NVMe sont démontées."
+}
+
+do_reset() {
+    require_root
+    worker_authorized
+
+    local NEW_USER="${RESET_PI_USERNAME:-}"
+    validate_username "$NEW_USER"
+
+    mkdir -p "$LOGDIR"
+
+    local LOG
+    LOG="$LOGDIR/reset-$(date +%Y%m%d-%H%M%S).log"
+    exec > >(tee -a "$LOG") 2>&1
+
+    echo
+    echo "=========================================="
+    echo " RESET RASPBERRY PI - DÉBUT"
+    echo " $(date)"
+    echo "=========================================="
+    echo
+
+    ok "Utilisateur du nouveau système : $NEW_USER"
+
+    check_environment
+
+    exec 9>"$LOCKFILE"
+    flock -n 9 || fail "Un autre reset-pi est déjà en cours."
+
+    unmount_nvme_completely
+    sync
+
+    echo
+    echo "=========================================="
+    echo " ÉCRITURE DE RASPBERRY PI OS"
+    echo "=========================================="
+    echo
+
+    xz -dc "$IMAGE" |
+        dd of="$TARGET" \
+           bs=16M \
+           iflag=fullblock \
+           conv=fsync \
+           status=progress
+
+    sync
+
+    echo
+    echo "Relecture de la table de partitions..."
+
+    partprobe "$TARGET" || true
+    udevadm settle
+    sleep 3
+
+    [[ -b "$P1" ]] || fail "$P1 introuvable après écriture."
+    [[ -b "$P2" ]] || fail "$P2 introuvable après écriture."
+
+    echo
+    echo "Extension de Raspberry Pi OS à la totalité du NVMe..."
+
+    parted -s "$TARGET" resizepart 2 100%
+    partprobe "$TARGET"
+    udevadm settle
+    sleep 2
+
+    local FSCK_RESULT
+    set +e
+    e2fsck -fy "$P2"
+    FSCK_RESULT=$?
+    set -e
+
+    (( FSCK_RESULT <= 1 )) \
+        || fail "e2fsck a échoué (code $FSCK_RESULT)."
+
+    resize2fs "$P2"
+
+    local BOOT="/mnt/reset-boot"
+    local ROOT="/mnt/reset-root"
+
+    mkdir -p "$BOOT" "$ROOT"
+
+    cleanup() {
+        sync || true
+        mountpoint -q "$BOOT" && umount "$BOOT" || true
+        mountpoint -q "$ROOT" && umount "$ROOT" || true
+    }
+
+    trap cleanup EXIT
+
+    mount "$P2" "$ROOT"
+    mount "$P1" "$BOOT"
+
+    grep -q 'VERSION_CODENAME=trixie' "$ROOT/etc/os-release" \
+        || fail "L'image installée n'est pas Raspberry Pi OS Trixie."
+
+    echo
+    echo "Configuration du système neuf..."
+
+    local HOSTNAME TIMEZONE PASSHASH UIDGID USER_UID
+
+    HOSTNAME="$(read_required "$BACKUP/system/hostname")"
+    TIMEZONE="$(read_required "$BACKUP/system/timezone")"
+    PASSHASH="$(cat "$BACKUP/user/user.passwd-hash")"
+    UIDGID="$(read_required "$BACKUP/user/user.uidgid")"
+    USER_UID="${UIDGID%%:*}"
+
+    [[ "$USER_UID" =~ ^[0-9]+$ ]] || fail "UID utilisateur invalide."
+
+    cat > "$BOOT/user-data" <<USERDATA
+#cloud-config
+hostname: ${HOSTNAME}
+manage_etc_hosts: true
+timezone: ${TIMEZONE}
+
+users:
+  - name: ${NEW_USER}
+    uid: ${USER_UID}
+    groups: users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: '${PASSHASH}'
+    sudo: 'ALL=(ALL) ALL'
+    ssh_authorized_keys:
+USERDATA
+
+    while IFS= read -r KEY; do
+        [[ -n "$KEY" ]] || continue
+        printf '      - %s\n' "$KEY" >> "$BOOT/user-data"
+    done < "$BACKUP/ssh/authorized_keys"
+
+    cat >> "$BOOT/user-data" <<'USERDATA'
+
+ssh_pwauth: false
+ssh_deletekeys: false
+ssh_genkeytypes: []
+enable_ssh: true
+
+rpi:
+  i2c: true
+USERDATA
+
+    cat > "$BOOT/meta-data" <<METADATA
+instance-id: ${HOSTNAME}-$(date +%s)
+local-hostname: ${HOSTNAME}
+METADATA
+
+    cat > "$BOOT/network-config" <<'NETCFG'
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      dhcp6: true
+      optional: true
+NETCFG
+
+    touch "$BOOT/ssh"
+
+    # Restaurer l'identité SSH du Raspberry Pi.
+    mkdir -p "$ROOT/etc/ssh"
+    rm -f "$ROOT"/etc/ssh/ssh_host_* || true
+    cp -a "$BACKUP/ssh/hostkeys/." "$ROOT/etc/ssh/"
+    chown root:root "$ROOT"/etc/ssh/ssh_host_*
+    chmod 600 "$ROOT"/etc/ssh/ssh_host_*_key
+    chmod 644 "$ROOT"/etc/ssh/ssh_host_*_key.pub
+
+    mkdir -p "$ROOT/etc/ssh/sshd_config.d"
+    cat > "$ROOT/etc/ssh/sshd_config.d/90-pi-recovery.conf" <<'SSHCONF'
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+SSHCONF
+
+    # Réinstaller la commande recovery sur le système principal.
+    install -D -o root -g root -m 750 \
+        "$SCRIPTS/recovery" \
+        "$ROOT/usr/local/sbin/recovery"
+
+    # Bootstrap Argon ONE V3 au premier démarrage.
+    mkdir -p "$ROOT/opt/argon-bootstrap"
+
+    install -m 700 \
+        "$SCRIPTS/argon1.sh" \
+        "$ROOT/opt/argon-bootstrap/argon1.sh"
+
+    install -m 600 \
+        "$BACKUP/argon/argononed.conf" \
+        "$ROOT/opt/argon-bootstrap/argononed.conf"
+
+    cat > "$ROOT/usr/local/sbin/argon-firstboot" <<'ARGONSCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+
+exec >> /var/log/argon-firstboot.log 2>&1
+
+if [[ -e /var/lib/argon-firstboot.done ]]; then
+    exit 0
+fi
+
+mkdir -p /lib/systemd/system-shutdown
+
+echo "Attente du réseau..."
+
+for ATTEMPT in $(seq 1 60); do
+    if getent hosts deb.debian.org >/dev/null 2>&1; then
+        break
+    fi
+    sleep 5
+done
+
+getent hosts deb.debian.org >/dev/null 2>&1 || exit 1
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y curl ca-certificates
+
+echo "Installation Argon ONE V3..."
+bash /opt/argon-bootstrap/argon1.sh
+
+install -o root -g root -m 644 \
+    /opt/argon-bootstrap/argononed.conf \
+    /etc/argononed.conf
+
+systemctl daemon-reload
+systemctl enable argononed.service
+systemctl restart argononed.service
+systemctl is-active --quiet argononed.service
+
+touch /var/lib/argon-firstboot.done
+systemctl disable argon-firstboot.service || true
+
+sync
+systemctl reboot
+ARGONSCRIPT
+
+    chmod 750 "$ROOT/usr/local/sbin/argon-firstboot"
+
+    cat > "$ROOT/etc/systemd/system/argon-firstboot.service" <<'ARGONUNIT'
+[Unit]
+Description=Installation automatique Argon ONE V3
+After=network-online.target cloud-final.service
+Wants=network-online.target
+ConditionPathExists=!/var/lib/argon-firstboot.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/argon-firstboot
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+ARGONUNIT
+
+    mkdir -p "$ROOT/etc/systemd/system/multi-user.target.wants"
+
+    ln -sf ../argon-firstboot.service \
+        "$ROOT/etc/systemd/system/multi-user.target.wants/argon-firstboot.service"
+
+    python3 -c \
+        'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' \
+        "$BOOT/user-data" \
+        || fail "user-data YAML invalide."
+
+    ok "user-data YAML valide"
+
+    sync
+    cleanup
+    trap - EXIT
+
+    echo
+    echo "=========================================="
+    echo " RÉINSTALLATION TERMINÉE"
+    echo "=========================================="
+    echo
+    echo "Utilisateur : $NEW_USER"
+    echo "Hostname    : $HOSTNAME"
+    echo
+    echo "Connexion finale :"
+    echo "  ssh ${NEW_USER}@${HOSTNAME}.local"
+    echo
+    echo "Argon ONE V3 sera installé au premier boot,"
+    echo "puis un dernier reboot automatique sera effectué."
+
+    sync
+    sleep 5
+    systemctl reboot
+}
+
+start_destructive_reset() {
+    require_root
+    check_environment
+
+    local CONFIRM1 CONFIRM2 TOKEN NEW_USER DEFAULT_USER EXPECTED_MODEL
+
+    DEFAULT_USER="$(read_required "$BACKUP/system/default_username")"
+    validate_username "$DEFAULT_USER"
+
+    echo
+    read -r -p "Nom du nouvel utilisateur [$DEFAULT_USER] : " NEW_USER
+    NEW_USER="${NEW_USER:-$DEFAULT_USER}"
+    validate_username "$NEW_USER"
+
+    EXPECTED_MODEL="$(read_required "$BACKUP/system/nvme.model")"
+
+    echo
+    echo "Utilisateur choisi : $NEW_USER"
+    echo
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo " ATTENTION : DESTRUCTION TOTALE DU NVMe"
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo
+    echo "Disque      : $TARGET"
+    echo "Modèle      : $EXPECTED_MODEL"
+    echo "Utilisateur : $NEW_USER"
+    echo
+    echo "Toutes les données du NVMe seront définitivement effacées."
+    echo
+
+    read -r -p "Tape exactement : RESET NVME : " CONFIRM1
+    [[ "$CONFIRM1" == "RESET NVME" ]] || fail "Confirmation annulée."
+
+    read -r -p "Tape exactement le modèle '$EXPECTED_MODEL' : " CONFIRM2
+    [[ "$CONFIRM2" == "$EXPECTED_MODEL" ]] || fail "Confirmation annulée."
+
+    TOKEN="$(cat /proc/sys/kernel/random/uuid)"
+
+    printf '%s' "$TOKEN" > "$AUTHFILE"
+    chmod 600 "$AUTHFILE"
+
+    systemctl reset-failed reset-pi-worker.service 2>/dev/null || true
+
+    echo
+    echo "Lancement du reset en tâche système..."
+
+    if systemd-run \
+        --unit=reset-pi-worker \
+        --collect \
+        --no-block \
+        --property=Type=exec \
+        --setenv="RESET_PI_TOKEN=$TOKEN" \
+        --setenv="RESET_PI_USERNAME=$NEW_USER" \
+        /usr/local/sbin/reset-pi --worker
+    then
+        echo
+        echo "Le reset continue même si la connexion SSH tombe."
+        echo
+        echo "Suivi :"
+        echo "  sudo journalctl -fu reset-pi-worker"
+        echo
+        echo "ou :"
+        echo "  sudo tail -f /opt/pi-recovery/logs/reset-*.log"
+    else
+        rm -f "$AUTHFILE"
+        fail "Impossible de démarrer le worker."
+    fi
+}
+
+case "${1:-}" in
+    --check)
+        require_root
+
+        echo
+        echo "======================================"
+        echo " Raspberry Pi Recovery - vérification"
+        echo "======================================"
+        echo
+
+        check_environment
+
+        echo
+        echo "Aucun octet n'a été écrit sur le NVMe."
+        ;;
+
+    --erase)
+        start_destructive_reset
+        ;;
+
+    --worker)
+        do_reset
+        ;;
+
+    *)
+        echo "Usage :"
+        echo "  sudo reset-pi --check"
+        echo "  sudo reset-pi --erase"
+        exit 1
+        ;;
+esac

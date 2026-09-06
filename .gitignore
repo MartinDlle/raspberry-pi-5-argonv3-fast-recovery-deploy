@@ -1,0 +1,7 @@
+# Ne jamais versionner les sauvegardes générées !
+backup/
+images/
+*.img
+*.img.xz
+*.log
+.DS_Store

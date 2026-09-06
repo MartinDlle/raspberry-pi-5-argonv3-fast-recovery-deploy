@@ -1,0 +1,22 @@
+# Ce projet stocke volontairement les valeurs spécifiques à la machine
+# sous /opt/pi-recovery/backup/system plutôt que dans un fichier de config
+# unique, afin de limiter les erreurs de quoting.
+#
+# Valeurs capturées automatiquement par install-recovery.sh :
+#
+# default_username
+# hostname
+# timezone
+# nvme.model
+# nvme.serial
+# nvme.size_bytes
+# image.sha256
+#
+# Cible par défaut du projet :
+# /dev/nvme0n1
+#
+# Boot order recommandé :
+# BOOT_ORDER=0xf416
+#
+# One-shot Recovery :
+# 0xf461
