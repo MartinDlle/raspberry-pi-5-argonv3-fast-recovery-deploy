@@ -387,4 +387,4 @@ Avec le script Argon actuellement utilisé sur Raspberry Pi OS, le ventilateur e
 
 ## Licence
 
-MIT — à utiliser à tes risques. Toujours conserver une sauvegarde des données importantes avant un reset.
+MIT 
